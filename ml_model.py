@@ -113,6 +113,9 @@ class ChurnPredictionModel:
             df_processed[col + '_encoded'] = le.fit_transform(df_processed[col].astype(str))
             self.label_encoders[col] = le
         
+        # Drop original categorical columns (keep only encoded versions)
+        df_processed.drop(columns=categorical_features, inplace=True)
+        
         # Store preprocessing artifacts
         preprocessing_info = {
             'numeric_features': numeric_features,

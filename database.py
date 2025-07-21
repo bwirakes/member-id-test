@@ -121,24 +121,24 @@ class NeonDBConnector:
                 member_id,
                 -- Current period (last 60 days)
                 SUM(CASE 
-                    WHEN order_date::date >= CURRENT_DATE - INTERVAL '60 days' 
+                    WHEN order_date::timestamp::date >= CURRENT_DATE - INTERVAL '60 days' 
                     THEN grand_total ELSE 0 
                 END) as spend_last_60_days,
                 
                 -- Previous period (61-120 days ago)
                 SUM(CASE 
-                    WHEN order_date::date >= CURRENT_DATE - INTERVAL '120 days' 
-                    AND order_date::date < CURRENT_DATE - INTERVAL '60 days'
+                    WHEN order_date::timestamp::date >= CURRENT_DATE - INTERVAL '120 days' 
+                    AND order_date::timestamp::date < CURRENT_DATE - INTERVAL '60 days'
                     THEN grand_total ELSE 0 
                 END) as spend_previous_60_days,
                 
                 -- Historical baseline (average monthly spend * 2)
                 AVG(CASE 
-                    WHEN order_date::date < CURRENT_DATE - INTERVAL '120 days'
+                    WHEN order_date::timestamp::date < CURRENT_DATE - INTERVAL '120 days'
                     THEN grand_total ELSE NULL 
                 END) * 2 as historical_60day_baseline
             FROM order_header
-            WHERE order_date::date >= CURRENT_DATE - INTERVAL '365 days' -- Need sufficient history
+            WHERE order_date::timestamp::date >= CURRENT_DATE - INTERVAL '365 days' -- Need sufficient history
             GROUP BY member_id
             HAVING COUNT(*) >= 3 -- Ensure sufficient transaction history
         ),
@@ -187,14 +187,14 @@ class NeonDBConnector:
                 oh.member_id,
                 
                 -- Recency features
-                CURRENT_DATE - MAX(oh.order_date::date) as days_since_last_order,
-                CURRENT_DATE - MIN(oh.order_date::date) as customer_age_days,
+                CURRENT_DATE - MAX(oh.order_date::timestamp::date) as days_since_last_order,
+                CURRENT_DATE - MIN(oh.order_date::timestamp::date) as customer_age_days,
                 
                 -- Frequency features
                 COUNT(DISTINCT oh.id) as total_orders,
-                COUNT(DISTINCT DATE_TRUNC('month', oh.order_date)) as active_months,
+                COUNT(DISTINCT DATE_TRUNC('month', oh.order_date::timestamp)) as active_months,
                 ROUND(COUNT(DISTINCT oh.id)::numeric / 
-                      NULLIF(COUNT(DISTINCT DATE_TRUNC('month', oh.order_date)), 0), 2) as avg_orders_per_month,
+                      NULLIF(COUNT(DISTINCT DATE_TRUNC('month', oh.order_date::timestamp)), 0), 2) as avg_orders_per_month,
                 
                 -- Monetary features
                 SUM(oh.grand_total) as total_gmv,
@@ -203,13 +203,13 @@ class NeonDBConnector:
                 
                 -- Trend features (last 3 months vs previous 3 months)
                 SUM(CASE 
-                    WHEN oh.order_date::date >= CURRENT_DATE - INTERVAL '90 days' 
+                    WHEN oh.order_date::timestamp::date >= CURRENT_DATE - INTERVAL '90 days' 
                     THEN oh.grand_total ELSE 0 
                 END) as gmv_last_90_days,
                 
                 SUM(CASE 
-                    WHEN oh.order_date::date >= CURRENT_DATE - INTERVAL '180 days' 
-                    AND oh.order_date::date < CURRENT_DATE - INTERVAL '90 days'
+                    WHEN oh.order_date::timestamp::date >= CURRENT_DATE - INTERVAL '180 days' 
+                    AND oh.order_date::timestamp::date < CURRENT_DATE - INTERVAL '90 days'
                     THEN oh.grand_total ELSE 0 
                 END) as gmv_previous_90_days,
                 
@@ -221,7 +221,7 @@ class NeonDBConnector:
                 oh.member_tier_when_transact as current_tier
                 
             FROM order_header oh
-            WHERE oh.order_date::date >= CURRENT_DATE - INTERVAL '365 days'
+            WHERE oh.order_date::timestamp::date >= CURRENT_DATE - INTERVAL '365 days'
             GROUP BY oh.member_id, oh.member_tier_when_transact
         ),
         product_features AS (
@@ -238,11 +238,11 @@ class NeonDBConnector:
                 SUM(oi.quantity * oi.paid_price) / NULLIF(SUM(oi.quantity * oi.price), 0) as avg_discount_rate,
                 
                 -- Category affinity (top 3 product groups)
-                STRING_AGG(DISTINCT oi.product_group, '|' ORDER BY COUNT(*) DESC) as top_product_groups
+                STRING_AGG(oi.product_group, '|') as top_product_groups
                 
             FROM order_header oh
             JOIN order_item oi ON oh.order_number = oi.order_number
-            WHERE oh.order_date::date >= CURRENT_DATE - INTERVAL '365 days'
+            WHERE oh.order_date::timestamp::date >= CURRENT_DATE - INTERVAL '365 days'
             GROUP BY oh.member_id
         ),
         behavioral_features AS (
@@ -250,12 +250,12 @@ class NeonDBConnector:
                 member_id,
                 
                 -- Seasonality patterns
-                MODE() WITHIN GROUP (ORDER BY EXTRACT(DOW FROM order_date)) as favorite_day_of_week,
-                AVG(EXTRACT(DOW FROM order_date)) as avg_day_of_week,
+                MODE() WITHIN GROUP (ORDER BY EXTRACT(DOW FROM order_date::timestamp)) as favorite_day_of_week,
+                AVG(EXTRACT(DOW FROM order_date::timestamp)) as avg_day_of_week,
                 
                 -- Order timing patterns
-                AVG(grand_total) FILTER (WHERE EXTRACT(DOW FROM order_date) IN (6,0)) as weekend_avg_spend,
-                AVG(grand_total) FILTER (WHERE EXTRACT(DOW FROM order_date) BETWEEN 1 AND 5) as weekday_avg_spend,
+                AVG(grand_total) FILTER (WHERE EXTRACT(DOW FROM order_date::timestamp) IN (6,0)) as weekend_avg_spend,
+                AVG(grand_total) FILTER (WHERE EXTRACT(DOW FROM order_date::timestamp) BETWEEN 1 AND 5) as weekday_avg_spend,
                 
                 -- Inter-purchase time
                 AVG(days_between_orders) as avg_days_between_orders,
@@ -266,9 +266,9 @@ class NeonDBConnector:
                     member_id,
                     order_date,
                     grand_total,
-                    order_date::date - LAG(order_date::date) OVER (PARTITION BY member_id ORDER BY order_date) as days_between_orders
+                    order_date::timestamp::date - LAG(order_date::timestamp::date) OVER (PARTITION BY member_id ORDER BY order_date::timestamp) as days_between_orders
                 FROM order_header
-                WHERE order_date::date >= CURRENT_DATE - INTERVAL '365 days'
+                WHERE order_date::timestamp::date >= CURRENT_DATE - INTERVAL '365 days'
             ) t
             GROUP BY member_id
         ),
