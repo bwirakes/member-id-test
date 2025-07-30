@@ -176,6 +176,99 @@ class NeonDBConnector:
         logger.info("Creating churn labels...")
         return self.execute_query(query)
     
+    def get_cohort_analysis(self) -> pd.DataFrame:
+        """
+        Performs a comprehensive cohort analysis for each tier and globally.
+        Calculates time-based churn rates, spend-based churn, and behavioral metrics.
+        """
+        query = """
+        WITH customer_periodic_spend AS (
+            SELECT
+                member_id,
+                member_tier_when_transact as tier,
+                MAX(order_date::date) as last_order_date,
+                MIN(order_date::date) as first_order_date,
+                
+                -- Spend in recent periods
+                SUM(CASE WHEN order_date::date > CURRENT_DATE - 30 THEN grand_total ELSE 0 END) as spend_last_30_days,
+                SUM(CASE WHEN order_date::date > CURRENT_DATE - 60 THEN grand_total ELSE 0 END) as spend_last_60_days,
+                SUM(CASE WHEN order_date::date > CURRENT_DATE - 90 THEN grand_total ELSE 0 END) as spend_last_90_days,
+                SUM(CASE WHEN order_date::date > CURRENT_DATE - 120 THEN grand_total ELSE 0 END) as spend_last_120_days,
+                
+                -- Historical spend for baseline (all spend before the last 120 days)
+                SUM(CASE WHEN order_date::date <= CURRENT_DATE - 120 THEN grand_total ELSE 0 END) as historical_spend,
+                
+                -- Count of historical days with transactions
+                COUNT(DISTINCT CASE WHEN order_date::date <= CURRENT_DATE - 120 THEN order_date::date ELSE NULL END) as historical_transaction_days,
+
+                -- Other base metrics
+                COUNT(DISTINCT id) as total_orders,
+                SUM(grand_total) as total_gmv,
+                COUNT(DISTINCT DATE_TRUNC('day', order_date::timestamp)) as total_visits
+            FROM order_header
+            WHERE member_tier_when_transact IS NOT NULL AND member_id IS NOT NULL
+            GROUP BY member_id, member_tier_when_transact
+        ),
+        member_churn_flags AS (
+            SELECT
+                *,
+                -- Historical daily average spend, avoiding division by zero
+                (historical_spend / NULLIF(historical_transaction_days, 1)) AS historical_daily_avg_spend,
+
+                -- 1. Visit Churn: No visit in the last 120 days
+                (CURRENT_DATE - last_order_date) > 120 as churn_120_day_visit,
+                
+                -- 2. Spend Churn: Spend in period is < 50% of historical average for that period length
+                (spend_last_30_days < (historical_spend / NULLIF(historical_transaction_days, 1) * 30 * 0.5)) as churn_30_day_spend,
+                (spend_last_60_days < (historical_spend / NULLIF(historical_transaction_days, 1) * 60 * 0.5)) as churn_60_day_spend,
+                (spend_last_90_days < (historical_spend / NULLIF(historical_transaction_days, 1) * 90 * 0.5)) as churn_90_day_spend,
+                (spend_last_120_days < (historical_spend / NULLIF(historical_transaction_days, 1) * 120 * 0.5)) as churn_120_day_spend,
+                
+                -- Behavioral metrics
+                (last_order_date - first_order_date) + 1 as active_days
+            FROM customer_periodic_spend
+        ),
+        -- Aggregate by tier
+        tier_analysis AS (
+            SELECT
+                tier,
+                AVG(CASE WHEN churn_120_day_visit THEN 1 ELSE 0 END) as churn_rate_120_day_visit,
+                AVG(CASE WHEN churn_30_day_spend THEN 1 ELSE 0 END) as churn_rate_30_day_spend,
+                AVG(CASE WHEN churn_60_day_spend THEN 1 ELSE 0 END) as churn_rate_60_day_spend,
+                AVG(CASE WHEN churn_90_day_spend THEN 1 ELSE 0 END) as churn_rate_90_day_spend,
+                AVG(CASE WHEN churn_120_day_spend THEN 1 ELSE 0 END) as churn_rate_120_day_spend,
+                
+                AVG(total_gmv / NULLIF(active_days / 30.44, 0)) as avg_monthly_spend,
+                AVG(total_visits / NULLIF(active_days / 30.44, 0)) as avg_monthly_visits,
+                AVG(total_orders::numeric / NULLIF(total_visits, 0)) as avg_orders_per_visit,
+                AVG(total_gmv / NULLIF(total_visits, 0)) as avg_spend_per_visit
+            FROM member_churn_flags
+            GROUP BY tier
+        ),
+        -- Aggregate for global results
+        global_analysis AS (
+            SELECT
+                'Global' as tier,
+                AVG(CASE WHEN churn_120_day_visit THEN 1 ELSE 0 END) as churn_rate_120_day_visit,
+                AVG(CASE WHEN churn_30_day_spend THEN 1 ELSE 0 END) as churn_rate_30_day_spend,
+                AVG(CASE WHEN churn_60_day_spend THEN 1 ELSE 0 END) as churn_rate_60_day_spend,
+                AVG(CASE WHEN churn_90_day_spend THEN 1 ELSE 0 END) as churn_rate_90_day_spend,
+                AVG(CASE WHEN churn_120_day_spend THEN 1 ELSE 0 END) as churn_rate_120_day_spend,
+                
+                AVG(total_gmv / NULLIF(active_days / 30.44, 0)) as avg_monthly_spend,
+                AVG(total_visits / NULLIF(active_days / 30.44, 0)) as avg_monthly_visits,
+                AVG(total_orders::numeric / NULLIF(total_visits, 0)) as avg_orders_per_visit,
+                AVG(total_gmv / NULLIF(total_visits, 0)) as avg_spend_per_visit
+            FROM member_churn_flags
+        )
+        SELECT * FROM tier_analysis
+        UNION ALL
+        SELECT * FROM global_analysis
+        ORDER BY tier;
+        """
+        logger.info("Fetching detailed cohort analysis with spend-based churn...")
+        return self.execute_query(query)
+    
     def create_feature_set(self) -> pd.DataFrame:
         """
         Create comprehensive feature set for churn prediction.
@@ -218,7 +311,7 @@ class NeonDBConnector:
                 MODE() WITHIN GROUP (ORDER BY oh.outlet_name) as primary_outlet,
                 
                 -- Membership features
-                oh.member_tier_when_transact as current_tier
+                oh.member_tier_when_transact
                 
             FROM order_header oh
             WHERE oh.order_date::timestamp::date >= CURRENT_DATE - INTERVAL '365 days'

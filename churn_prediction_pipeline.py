@@ -57,6 +57,8 @@ class ChurnPredictionPipeline:
         self.ml_model = None
         self.churn_labels = None
         self.features = None
+        self.tier_summary = None
+        self.cohort_analysis = None
         self.final_dataset = None
         self.results = {}
         
@@ -96,36 +98,33 @@ class ChurnPredictionPipeline:
             # Get table information
             for table in ['order_header', 'order_item']:
                 logger.info(f"Exploring {table} table...")
-                
-                # Table structure
                 table_info = self.db_connector.get_table_info(table)
                 exploration_results[f'{table}_structure'] = table_info
-                
-                # Row count
                 row_count = self.db_connector.get_table_row_count(table)
                 exploration_results[f'{table}_row_count'] = row_count
                 logger.info(f"{table} has {row_count:,} rows")
                 
-                # Date range for order_header
                 if table == 'order_header':
                     date_info = self.db_connector.get_date_range(table, 'order_date')
                     exploration_results[f'{table}_date_range'] = date_info
-                    logger.info(f"Date range: {date_info['min_date']} to {date_info['max_date']}")
-            
-            # Sample queries to understand data distribution
+                    if date_info:
+                        logger.info(f"Date range: {date_info.get('min_date')} to {date_info.get('max_date')}")
+
+            # This query was causing a type casting error. Correcting it.
             sample_query = """
             SELECT 
                 COUNT(DISTINCT member_id) as unique_customers,
                 COUNT(*) as total_orders,
                 AVG(grand_total) as avg_order_value,
-                MIN(order_date) as first_order,
-                MAX(order_date) as last_order
+                MIN(order_date::timestamp::date) as first_order,
+                MAX(order_date::timestamp::date) as last_order
             FROM order_header
-            WHERE order_date >= CURRENT_DATE - INTERVAL '365 days'
+            WHERE order_date::timestamp::date >= CURRENT_DATE - INTERVAL '365 days'
             """
             
             summary_stats = self.db_connector.execute_query(sample_query)
-            exploration_results['summary_stats'] = summary_stats.iloc[0].to_dict()
+            if not summary_stats.empty:
+                exploration_results['summary_stats'] = summary_stats.iloc[0].to_dict()
             
             logger.info("Data exploration completed successfully")
             
@@ -181,12 +180,26 @@ class ChurnPredictionPipeline:
             logger.error(f"Error extracting features: {e}")
             raise
     
+    def extract_cohort_analysis(self) -> pd.DataFrame:
+        """Extracts detailed cohort analysis data."""
+        logger.info("Extracting cohort analysis data...")
+        try:
+            self.cohort_analysis = self.db_connector.get_cohort_analysis()
+            logger.info("Cohort analysis extracted successfully.")
+            return self.cohort_analysis
+        except Exception as e:
+            logger.error(f"Error extracting cohort analysis: {e}")
+            raise
+    
     def create_final_dataset(self) -> pd.DataFrame:
         """Combine churn labels and features into final modeling dataset."""
         logger.info("Creating final dataset...")
         
         try:
-            # Merge churn labels and features
+            # Ensure features includes the tier column for hierarchical modeling
+            if 'member_tier_when_transact' not in self.features.columns:
+                 raise ValueError("Feature set must include 'member_tier_when_transact' for hierarchical modeling.")
+
             self.final_dataset = pd.merge(
                 self.churn_labels[['member_id', 'is_churned']],
                 self.features,
@@ -196,12 +209,9 @@ class ChurnPredictionPipeline:
             
             logger.info(f"Final dataset created:")
             logger.info(f"  - Total samples: {len(self.final_dataset):,}")
-            logger.info(f"  - Features: {len(self.final_dataset.columns) - 2}")  # -2 for member_id and is_churned
+            logger.info(f"  - Features: {len(self.final_dataset.columns) - 2}")
             logger.info(f"  - Missing values: {self.final_dataset.isnull().sum().sum()}")
-            
-            # Check data balance
-            churn_distribution = self.final_dataset['is_churned'].value_counts()
-            logger.info(f"  - Class distribution: {dict(churn_distribution)}")
+            logger.info(f"  - Tiers found: {self.final_dataset['member_tier_when_transact'].unique()}")
             
             return self.final_dataset
             
@@ -210,39 +220,22 @@ class ChurnPredictionPipeline:
             raise
     
     def train_models(self) -> Dict[str, Any]:
-        """Train and evaluate multiple ML models."""
-        logger.info("Starting model training...")
+        """Train hierarchical models: one for each tier and a global fallback."""
+        logger.info("Starting hierarchical model training...")
         
         try:
-            # Initialize ML model
             self.ml_model = ChurnPredictionModel(random_state=self.config.RANDOM_STATE)
             
-            # Prepare features
-            features_df, preprocessing_info = self.ml_model.prepare_features(self.final_dataset)
+            # The new method handles all training logic internally
+            self.ml_model.train_hierarchical_models(self.final_dataset)
             
-            # Separate features and target
-            X = features_df.drop(['member_id', 'is_churned'], axis=1, errors='ignore')
-            y = features_df['is_churned']
-            
-            logger.info(f"Training dataset shape: {X.shape}")
-            logger.info(f"Feature columns: {list(X.columns)}")
-            
-            # Train models
-            training_results = self.ml_model.train_models(X, y)
-            
-            # Store results
+            training_results = self.ml_model.get_model_summary()
             self.results['training_results'] = training_results
-            self.results['preprocessing_info'] = preprocessing_info
             
-            # Model evaluation
-            evaluation_results = self.ml_model.evaluate_model(X, y)
-            self.results['evaluation_results'] = evaluation_results
+            # Get feature importance for all models
+            self.results['feature_importance'] = self.ml_model.get_feature_importance(top_n=20)
             
-            # Feature importance
-            feature_importance = self.ml_model.get_feature_importance(top_n=20)
-            self.results['feature_importance'] = feature_importance
-            
-            logger.info("Model training completed successfully!")
+            logger.info("Hierarchical model training completed successfully!")
             
             return training_results
             
@@ -251,44 +244,38 @@ class ChurnPredictionPipeline:
             raise
     
     def generate_predictions(self, save_predictions: bool = True) -> pd.DataFrame:
-        """Generate predictions for all customers."""
+        """Generate predictions for all customers using the hierarchical model."""
         logger.info("Generating predictions...")
         
         try:
-            # Prepare features for prediction
-            features_df, _ = self.ml_model.prepare_features(self.final_dataset)
-            X = features_df.drop(['member_id', 'is_churned'], axis=1, errors='ignore')
+            # The new prediction method takes the full dataframe and routes internally
+            predictions_df = self.ml_model.predict_churn_probability(self.final_dataset)
+
+            # Merge with actuals and create final prediction columns
+            final_predictions = pd.merge(
+                self.final_dataset[['member_id', 'is_churned']],
+                predictions_df,
+                on='member_id'
+            ).rename(columns={'is_churned': 'actual_churn'})
             
-            # Generate predictions
-            churn_probabilities = self.ml_model.predict_churn_probability(X)
-            churn_predictions = (churn_probabilities >= 0.5).astype(int)
-            
-            # Create predictions DataFrame
-            predictions_df = pd.DataFrame({
-                'member_id': self.final_dataset['member_id'],
-                'actual_churn': self.final_dataset['is_churned'],
-                'predicted_churn': churn_predictions,
-                'churn_probability': churn_probabilities
-            })
-            
-            # Add risk segments
-            predictions_df['risk_segment'] = pd.cut(
-                predictions_df['churn_probability'],
+            final_predictions['predicted_churn'] = (final_predictions['churn_probability'] >= 0.5).astype(int)
+            final_predictions['risk_segment'] = pd.cut(
+                final_predictions['churn_probability'],
                 bins=[0, 0.3, 0.7, 1.0],
-                labels=['Low Risk', 'Medium Risk', 'High Risk']
+                labels=['Low Risk', 'Medium Risk', 'High Risk'],
+                include_lowest=True
             )
             
             if save_predictions:
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 filename = f'churn_predictions_{timestamp}.csv'
-                predictions_df.to_csv(filename, index=False)
+                final_predictions.to_csv(filename, index=False)
                 logger.info(f"Predictions saved to {filename}")
             
-            self.results['predictions'] = predictions_df
+            self.results['predictions'] = final_predictions
+            logger.info(f"Predictions generated for {len(final_predictions):,} customers")
             
-            logger.info(f"Predictions generated for {len(predictions_df):,} customers")
-            
-            return predictions_df
+            return final_predictions
             
         except Exception as e:
             logger.error(f"Error generating predictions: {e}")
@@ -305,55 +292,88 @@ class ChurnPredictionPipeline:
         return filepath
     
     def generate_report(self) -> Dict[str, Any]:
-        """Generate comprehensive report of the pipeline results."""
-        logger.info("Generating final report...")
+        """Generate comprehensive report comparing hierarchical models."""
+        logger.info("Generating final hierarchical report...")
         
         try:
+            summary = self.ml_model.get_model_summary()
             report = {
                 'pipeline_summary': {
                     'execution_time': datetime.now().isoformat(),
-                    'data_shape': self.final_dataset.shape if self.final_dataset is not None else None,
-                    'best_model': self.ml_model.best_model_name if self.ml_model else None
+                    'data_shape': self.final_dataset.shape if self.final_dataset is not None else "N/A",
+                    'model_type': 'Hierarchical XGBoost'
                 },
+                'cohort_analysis': self.cohort_analysis.to_dict('records') if self.cohort_analysis is not None else [],
                 'data_summary': self.results.get('churn_stats', {}),
-                'model_performance': self.ml_model.get_model_summary() if self.ml_model else {},
-                'top_features': self.results.get('feature_importance', pd.DataFrame()).to_dict('records')
+                'model_performance': summary,
+                'top_features': self.results.get('feature_importance', {})
             }
             
-            # Save report
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             report_filename = f'churn_prediction_report_{timestamp}.txt'
             
             with open(report_filename, 'w') as f:
                 f.write("=" * 80 + "\n")
-                f.write("CHURN PREDICTION PIPELINE REPORT\n")
+                f.write("HIERARCHICAL CHURN PREDICTION PIPELINE REPORT\n")
                 f.write("=" * 80 + "\n\n")
                 
                 f.write(f"Execution Time: {report['pipeline_summary']['execution_time']}\n")
-                f.write(f"Dataset Shape: {report['pipeline_summary']['data_shape']}\n")
-                f.write(f"Best Model: {report['pipeline_summary']['best_model']}\n\n")
+                f.write(f"Dataset Shape: {report['pipeline_summary']['data_shape']}\n\n")
                 
-                if 'churn_stats' in self.results:
-                    stats = self.results['churn_stats']
-                    f.write("DATA SUMMARY:\n")
-                    f.write(f"  Total Customers: {stats['total_customers']:,}\n")
-                    f.write(f"  Churned Customers: {stats['churned_customers']:,}\n")
-                    f.write(f"  Churn Rate: {stats['churn_rate']:.2%}\n\n")
+                f.write("COHORT ANALYSIS & CHURN RATES\n")
+                f.write("-" * 80 + "\n")
+                if report.get('cohort_analysis'):
+                    for cohort_stats in report['cohort_analysis']:
+                        tier = cohort_stats.get('tier', 'N/A').upper()
+                        f.write(f"--- Cohort: {tier} ---\n")
+                        f.write("  Visit-Based Churn:\n")
+                        f.write(f"    - 120-Day Visit Churn Rate: {cohort_stats.get('churn_rate_120_day_visit', 0):.2%}\n")
+                        f.write("  Spend-Based Churn (vs. Historical Avg):\n")
+                        f.write(f"    - 30-Day Spend Churn Rate: {cohort_stats.get('churn_rate_30_day_spend', 0):.2%}\n")
+                        f.write(f"    - 60-Day Spend Churn Rate: {cohort_stats.get('churn_rate_60_day_spend', 0):.2%}\n")
+                        f.write(f"    - 90-Day Spend Churn Rate: {cohort_stats.get('churn_rate_90_day_spend', 0):.2%}\n")
+                        f.write(f"    - 120-Day Spend Churn Rate: {cohort_stats.get('churn_rate_120_day_spend', 0):.2%}\n")
+                        f.write("  Behavioral Metrics:\n")
+                        f.write(f"    - Avg Monthly Spend: ${cohort_stats.get('avg_monthly_spend', 0):,.2f}\n")
+                        f.write(f"    - Avg Monthly Visits: {cohort_stats.get('avg_monthly_visits', 0):,.2f}\n")
+                        f.write(f"    - Avg Orders per Visit: {cohort_stats.get('avg_orders_per_visit', 0):,.2f}\n")
+                        f.write(f"    - Avg Spend per Visit: ${cohort_stats.get('avg_spend_per_visit', 0):,.2f}\n\n")
+                else:
+                    f.write("  Cohort analysis not available.\n\n")
+
+                f.write("MODEL PERFORMANCE SUMMARY\n")
+                f.write("-" * 80 + "\n")
                 
-                if self.ml_model:
-                    f.write("MODEL PERFORMANCE:\n")
-                    model_summary = self.ml_model.get_model_summary()
-                    for model_name, metrics in model_summary.items():
-                        f.write(f"  {model_name}:\n")
-                        f.write(f"    CV AUC: {metrics['cv_mean_auc']:.4f} ± {metrics['cv_std_auc']:.4f}\n")
-                        f.write(f"    Full Data AUC: {metrics['full_data_auc']:.4f}\n")
-                        f.write(f"    Average Precision: {metrics['average_precision']:.4f}\n\n")
-                
-                if not self.results.get('feature_importance', pd.DataFrame()).empty:
-                    f.write("TOP FEATURES:\n")
-                    for idx, row in self.results['feature_importance'].head(10).iterrows():
-                        f.write(f"  {row['feature']}: {row['importance']:.4f}\n")
-            
+                # Global Model Performance
+                global_perf = report['model_performance'].get('global', {})
+                if global_perf:
+                    f.write("--- Global Model (Fallback) ---\n")
+                    f.write(f"  AUC on full dataset: {global_perf.get('auc', 'N/A'):.4f}\n")
+                    f.write(f"  Sample Size: {global_perf.get('sample_size', 'N/A'):,}\n")
+                    f.write(f"  Churn Rate in training data: {global_perf.get('churn_rate', 'N/A'):.2%}\n\n")
+
+                # Tier-specific Model Performance
+                tier_perf = report['model_performance'].get('tiers', {})
+                if tier_perf:
+                    f.write("--- Tier-Specific Models ---\n")
+                    for tier, metrics in sorted(tier_perf.items()):
+                        f.write(f"  Tier: {tier.upper()}\n")
+                        f.write(f"    AUC on tier data: {metrics.get('auc', 'N/A'):.4f}\n")
+                        f.write(f"    Sample Size: {metrics.get('sample_size', 'N/A'):,}\n")
+                        f.write(f"    Churn Rate in tier data: {metrics.get('churn_rate', 'N/A'):.2%}\n\n")
+
+                f.write("TOP 10 FEATURES BY MODEL\n")
+                f.write("-" * 80 + "\n")
+                if 'top_features' in report and report['top_features']:
+                    for tier, importance_df in report['top_features'].items():
+                        f.write(f"--- {tier.upper()} Model ---\n")
+                        if not importance_df.empty:
+                            for feature, importance in importance_df.head(10).iterrows():
+                                f.write(f"  {feature:<30}: {importance['importance']:.4f}\n")
+                        else:
+                            f.write("  Importance not available.\n")
+                        f.write("\n")
+
             logger.info(f"Report saved to {report_filename}")
             return report
             
@@ -361,88 +381,91 @@ class ChurnPredictionPipeline:
             logger.error(f"Error generating report: {e}")
             return {}
     
+    def load_existing_results(self, model_path: str, predictions_path: str):
+        """Load existing model and predictions to regenerate a report."""
+        logger.info(f"Loading existing model from {model_path}...")
+        self.ml_model = ChurnPredictionModel()
+        self.ml_model.load_model(model_path)
+        
+        logger.info(f"Loading existing predictions from {predictions_path}...")
+        self.results['predictions'] = pd.read_csv(predictions_path)
+        self.final_dataset = self.results['predictions'] # For shape reporting
+        self.results['churn_stats'] = {
+            'total_customers': len(self.final_dataset),
+            'churned_customers': self.final_dataset['actual_churn'].sum(),
+            'churn_rate': self.final_dataset['actual_churn'].mean()
+        }
+
     def run_pipeline(self, save_outputs: bool = True) -> bool:
         """Run the complete churn prediction pipeline."""
         logger.info("Starting Churn Prediction Pipeline...")
         logger.info("=" * 80)
         
         try:
-            # Step 1: Setup database connection
-            if not self.setup_database_connection():
-                logger.error("Pipeline failed: Could not establish database connection")
-                return False
-            
-            # Step 2: Explore data (optional)
+            if not self.setup_database_connection(): return False
             self.explore_data()
-            
-            # Step 3: Extract churn labels
+            self.extract_cohort_analysis()
             self.extract_churn_labels()
-            
-            # Step 4: Extract features
             self.extract_features()
-            
-            # Step 5: Create final dataset
             self.create_final_dataset()
-            
-            # Step 6: Train models
             self.train_models()
-            
-            # Step 7: Generate predictions
             self.generate_predictions(save_predictions=save_outputs)
-            
-            # Step 8: Save model
-            if save_outputs:
-                self.save_model()
-            
-            # Step 9: Generate report
+            if save_outputs: self.save_model()
             self.generate_report()
             
             logger.info("=" * 80)
             logger.info("Churn Prediction Pipeline completed successfully!")
             
-            # Print summary
-            if self.ml_model:
-                best_model = self.ml_model.best_model_name
-                best_auc = self.ml_model.results[best_model]['cv_mean_auc']
-                logger.info(f"Best Model: {best_model} (CV AUC: {best_auc:.4f})")
-            
-            if 'churn_stats' in self.results:
-                stats = self.results['churn_stats']
-                logger.info(f"Churn Rate: {stats['churn_rate']:.2%} ({stats['churned_customers']:,}/{stats['total_customers']:,})")
-            
+            summary = self.ml_model.get_model_summary()
+            if summary.get('global'):
+                global_auc = summary['global']['auc']
+                logger.info(f"Global Model AUC: {global_auc:.4f}")
+            if summary.get('tiers'):
+                logger.info("Tier-specific model AUCs:")
+                for tier, metrics in summary['tiers'].items():
+                    logger.info(f"  - {tier}: {metrics['auc']:.4f}")
+
             return True
             
         except Exception as e:
-            logger.error(f"Pipeline failed with error: {e}")
+            logger.error(f"Pipeline failed with error: {e}", exc_info=True)
             return False
 
 def main():
     """Main function to run the churn prediction pipeline."""
     logger.info("Initializing Churn Prediction Pipeline...")
     
-    # Create pipeline instance
     pipeline = ChurnPredictionPipeline()
-    
-    # Run the complete pipeline
     success = pipeline.run_pipeline(save_outputs=True)
     
     if success:
         logger.info("Pipeline execution completed successfully!")
-        
-        # Optional: Display feature importance plot
-        if pipeline.ml_model:
-            try:
-                logger.info("Generating feature importance plot...")
-                pipeline.ml_model.plot_feature_importance()
-                
-                logger.info("Generating model comparison plot...")
-                pipeline.ml_model.plot_model_comparison()
-            except Exception as e:
-                logger.warning(f"Could not generate plots: {e}")
-        
+        # NOTE: Plotting functions were removed as they are not compatible
+        # with the new hierarchical model structure without significant rework.
+        # The detailed text report now provides model comparison insights.
     else:
         logger.error("Pipeline execution failed!")
         sys.exit(1)
 
+def regenerate_report(model_path: str, predictions_path: str):
+    """Function to regenerate a report from existing model and prediction files."""
+    logger.info("Initializing report regeneration...")
+    
+    pipeline = ChurnPredictionPipeline()
+    if not pipeline.setup_database_connection():
+        logger.error("Failed to connect to the database. Aborting.")
+        return
+
+    pipeline.extract_cohort_analysis()
+    pipeline.load_existing_results(model_path, predictions_path)
+    pipeline.generate_report()
+    
+    logger.info("Report regeneration completed successfully!")
+
 if __name__ == "__main__":
     main() 
+    # Example of how to regenerate a report:
+    # regenerate_report(
+    #     model_path='churn_model_20250727_084311.pkl',
+    #     predictions_path='churn_predictions_20250727_084311.csv'
+    # ) 

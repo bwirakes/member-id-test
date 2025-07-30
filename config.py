@@ -4,13 +4,13 @@ from typing import Optional
 class Config:
     """Configuration class for the churn prediction project."""
     
-    # Neon Database Configuration
-    NEON_DB_HOST: str = os.getenv('NEON_DB_HOST', 'your-neon-hostname.neon.tech')
-    NEON_DB_NAME: str = os.getenv('NEON_DB_NAME', 'your-database-name')
-    NEON_DB_USER: str = os.getenv('NEON_DB_USER', 'your-username')
-    NEON_DB_PASSWORD: str = os.getenv('NEON_DB_PASSWORD', 'your-password')
-    NEON_DB_PORT: int = int(os.getenv('NEON_DB_PORT', '5432'))
-    NEON_DB_SSLMODE: str = os.getenv('NEON_DB_SSLMODE', 'require')
+    # Neon Database Configuration (Hardcoded for direct script execution)
+    NEON_DB_HOST: str = "ep-holy-water-a12w1h8d-pooler.ap-southeast-1.aws.neon.tech"
+    NEON_DB_NAME: str = "neondb"
+    NEON_DB_USER: str = "neondb_owner"
+    NEON_DB_PASSWORD: str = "npg_w1NLHMyxSRg7"
+    NEON_DB_PORT: int = 5432
+    NEON_DB_SSLMODE: str = "require"
     
     # Model Configuration
     RANDOM_STATE: int = 42
@@ -42,6 +42,6 @@ class Config:
         ]
         
         return all(
-            field and field != f'your-{field.split("_")[-1].lower()}' 
+            field and not field.startswith('your-')
             for field in required_fields
         ) 
